@@ -1,0 +1,20 @@
+[package]
+name = "virtualfacility"
+version = "0.1.0"
+edition = "2021"
+description = "A cautious Linux namespace test-facility prototype derived from the Kubernetes-free testing transcript."
+license = "MIT"
+
+[lib]
+name = "virtualfacility"
+path = "src/lib.rs"
+
+[[bin]]
+name = "virtualfacility"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { version = "1", features = ["rt"] }
