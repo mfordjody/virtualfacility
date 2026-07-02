@@ -45,6 +45,46 @@ fn create_bridge_without_name_only_prints_hint_even_with_saved_context() {
 }
 
 #[test]
+fn create_bridge_rejects_command_word_name() {
+    let workdir = temp_workdir("create-bridge-command-word");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let output = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["create", "bridge", "status"])
+        .output()
+        .expect("create bridge command should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid bridge name `status`"));
+    assert!(stderr.contains("command words cannot be used as resource names"));
+    assert!(!stderr.contains("creating bridge"));
+}
+
+#[test]
+fn create_bridge_requires_vf_prefix() {
+    let workdir = temp_workdir("create-bridge-prefix");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let output = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["create", "bridge", "lab1"])
+        .output()
+        .expect("create bridge command should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid bridge name `lab1`"));
+    assert!(stderr.contains("bridge names must start with `vf-`"));
+    assert!(!stderr.contains("creating bridge"));
+}
+
+#[test]
 fn delete_bridge_rejects_extra_targets() {
     let workdir = temp_workdir("delete-bridge-extra");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
@@ -104,8 +144,26 @@ fn delete_node_requires_explicit_target() {
 }
 
 #[test]
-fn delete_unknown_pod_reports_unknown_before_running_delete() {
-    let workdir = temp_workdir("delete-unknown-pod");
+fn create_custom_node_is_not_rejected_by_static_topology() {
+    let workdir = temp_workdir("create-custom-node");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let output = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["create", "node", "node-1"])
+        .output()
+        .expect("create node command should run");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("unknown node `node-1`"));
+}
+
+#[test]
+fn delete_custom_pod_is_not_rejected_by_static_topology() {
+    let workdir = temp_workdir("delete-custom-pod");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let output = Command::new(bin)
@@ -118,6 +176,43 @@ fn delete_unknown_pod_reports_unknown_before_running_delete() {
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown pod `ghost`"));
+    assert!(!stderr.contains("unknown pod `ghost`"));
     assert!(!stderr.contains("deleting pod"));
+}
+
+#[test]
+fn create_custom_pod_is_not_rejected_by_static_topology() {
+    let workdir = temp_workdir("create-custom-pod");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let output = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["create", "pod", "app-1"])
+        .output()
+        .expect("create pod command should run");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("unknown pod `app-1`"));
+}
+
+#[test]
+fn create_custom_pod_accepts_explicit_node() {
+    let workdir = temp_workdir("create-custom-pod-node");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let output = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["create", "pod", "app-1", "--node", "node-1"])
+        .output()
+        .expect("create pod command should run");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("unknown node `node-1`"));
+    assert!(!stderr.contains("unknown pod `app-1`"));
 }

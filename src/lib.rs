@@ -487,14 +487,21 @@ pub struct TopologyBuilder {
     name: String,
     bridge_name: String,
     bridge_addr: Ipv4Addr,
-    nodes: Vec<String>,
+    nodes: Vec<PendingNode>,
     pods: Vec<PendingPod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingNode {
+    name: String,
+    index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingPod {
     name: String,
     node: String,
+    index: Option<usize>,
     workload: Option<Vec<String>>,
 }
 
@@ -1139,7 +1146,18 @@ impl TopologyBuilder {
     }
 
     pub fn add_node(mut self, name: impl Into<String>) -> Self {
-        self.nodes.push(name.into());
+        self.nodes.push(PendingNode {
+            name: name.into(),
+            index: None,
+        });
+        self
+    }
+
+    pub fn add_node_with_index(mut self, name: impl Into<String>, index: usize) -> Self {
+        self.nodes.push(PendingNode {
+            name: name.into(),
+            index: Some(index),
+        });
         self
     }
 
@@ -1147,6 +1165,22 @@ impl TopologyBuilder {
         self.pods.push(PendingPod {
             name: name.into(),
             node: node.into(),
+            index: None,
+            workload: None,
+        });
+        self
+    }
+
+    pub fn add_pod_with_index(
+        mut self,
+        name: impl Into<String>,
+        node: impl Into<String>,
+        index: usize,
+    ) -> Self {
+        self.pods.push(PendingPod {
+            name: name.into(),
+            node: node.into(),
+            index: Some(index),
             workload: None,
         });
         self
@@ -1161,6 +1195,23 @@ impl TopologyBuilder {
         self.pods.push(PendingPod {
             name: name.into(),
             node: node.into(),
+            index: None,
+            workload: Some(command.into_iter().map(Into::into).collect()),
+        });
+        self
+    }
+
+    pub fn add_workload_pod_with_index(
+        mut self,
+        name: impl Into<String>,
+        node: impl Into<String>,
+        index: usize,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.pods.push(PendingPod {
+            name: name.into(),
+            node: node.into(),
+            index: Some(index),
             workload: Some(command.into_iter().map(Into::into).collect()),
         });
         self
@@ -1185,11 +1236,27 @@ impl TopologyBuilder {
         }
 
         let mut node_names = BTreeSet::new();
+        let mut node_indexes = BTreeSet::new();
         let mut nodes = Vec::with_capacity(self.nodes.len());
-        for (index, name) in self.nodes.into_iter().enumerate() {
+        for (fallback_index, node) in self.nodes.into_iter().enumerate() {
+            let name = node.name;
             validate_name("node", &name)?;
             if !node_names.insert(name.clone()) {
                 return Err(FacilityError::DuplicateName { kind: "node", name });
+            }
+            let index = node.index.unwrap_or(fallback_index);
+            if index > 239 {
+                return Err(FacilityError::TooManyItems {
+                    kind: "node index",
+                    max: 239,
+                    actual: index,
+                });
+            }
+            if !node_indexes.insert(index) {
+                return Err(FacilityError::DuplicateName {
+                    kind: "node index",
+                    name: index.to_string(),
+                });
             }
             nodes.push(Node { name, index });
         }
@@ -1200,7 +1267,8 @@ impl TopologyBuilder {
             .collect::<BTreeSet<_>>();
         let mut pod_names = BTreeSet::new();
         let mut pods = Vec::with_capacity(self.pods.len());
-        for (index, pod) in self.pods.into_iter().enumerate() {
+        let mut pod_indexes = BTreeSet::new();
+        for (fallback_index, pod) in self.pods.into_iter().enumerate() {
             validate_name("pod", &pod.name)?;
             if !pod_names.insert(pod.name.clone()) {
                 return Err(FacilityError::DuplicateName {
@@ -1212,6 +1280,20 @@ impl TopologyBuilder {
                 return Err(FacilityError::UnknownNode {
                     pod: pod.name,
                     node: pod.node,
+                });
+            }
+            let index = pod.index.unwrap_or(fallback_index);
+            if index > 239 {
+                return Err(FacilityError::TooManyItems {
+                    kind: "pod index",
+                    max: 239,
+                    actual: index,
+                });
+            }
+            if !pod_indexes.insert(index) {
+                return Err(FacilityError::DuplicateName {
+                    kind: "pod index",
+                    name: index.to_string(),
                 });
             }
             pods.push(Pod {
