@@ -283,7 +283,31 @@ fn args_with_context(name: &str, bridge: &str) -> Vec<String> {
     ]
 }
 
+fn fail_usage(message: impl AsRef<str>) -> ! {
+    eprintln!("{}", message.as_ref());
+    process::exit(2);
+}
+
+fn reject_extra_args(command: &str, extra: &[String]) -> ! {
+    fail_usage(format!(
+        "{command} accepts one target only; unexpected extra arguments: {}",
+        extra.join(" ")
+    ))
+}
+
+fn require_exact_args(op_args: &[String], command: &str, expected_len: usize) {
+    if op_args.len() < expected_len {
+        fail_usage(format!("{command} requires a target name"));
+    }
+    if op_args.len() > expected_len {
+        reject_extra_args(command, &op_args[expected_len..]);
+    }
+}
+
 fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> FacilityContext {
+    if op_args.len() > 2 {
+        reject_extra_args(&format!("{action} bridge"), &op_args[2..]);
+    }
     if let Some(bridge) = op_args.get(1) {
         return FacilityContext {
             name: explicit_name(args).unwrap_or_else(|| facility_from_bridge(bridge)),
@@ -308,6 +332,78 @@ fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> 
         eprintln!("example: cargo run -- {action} bridge vf-lab1");
     }
     process::exit(2);
+}
+
+fn ensure_linux() -> Result<()> {
+    if env::consts::OS != "linux" {
+        return Err(virtualfacility::FacilityError::UnsupportedPlatform {
+            current: env::consts::OS,
+        });
+    }
+    Ok(())
+}
+
+fn netns_names() -> Result<Vec<String>> {
+    ensure_linux()?;
+    let output = ProcessCommand::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .map_err(|err| virtualfacility::FacilityError::CommandFailed {
+            command: "ip netns list".to_string(),
+            code: None,
+            stderr: err.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(virtualfacility::FacilityError::CommandFailed {
+            command: "ip netns list".to_string(),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect())
+}
+
+fn bridge_exists(bridge: &str) -> Result<bool> {
+    ensure_linux()?;
+    let output = ProcessCommand::new("ip")
+        .args(["link", "show", bridge])
+        .output()
+        .map_err(|err| virtualfacility::FacilityError::CommandFailed {
+            command: format!("ip link show {bridge}"),
+            code: None,
+            stderr: err.to_string(),
+        })?;
+    Ok(output.status.success())
+}
+
+fn node_namespace(topology: &Topology, node_name: &str) -> Result<String> {
+    topology
+        .nodes()
+        .iter()
+        .find(|node| node.name() == node_name)
+        .map(|node| format!("vf-{}-node-{}", topology.name(), node.name()))
+        .ok_or_else(|| virtualfacility::FacilityError::UnknownNodeName {
+            name: node_name.to_string(),
+        })
+}
+
+fn require_bridge_exists(bridge: &str) -> Result<()> {
+    if bridge_exists(bridge)? {
+        return Ok(());
+    }
+    eprintln!("bridge `{bridge}` does not exist");
+    process::exit(1);
+}
+
+fn require_netns_exists(kind: &str, name: &str, netns: &str, netns_list: &[String]) {
+    if netns_list.iter().any(|existing| existing == netns) {
+        return;
+    }
+    eprintln!("{kind} `{name}` does not exist: namespace `{netns}` was not found");
+    process::exit(1);
 }
 
 fn operation_args(args: &[String]) -> Vec<String> {
@@ -351,44 +447,16 @@ fn run_down(args: &[String]) -> Result<()> {
 }
 
 fn run_status(args: &[String]) -> Result<()> {
-    if env::consts::OS != "linux" {
-        return Err(virtualfacility::FacilityError::UnsupportedPlatform {
-            current: env::consts::OS,
-        });
-    }
+    ensure_linux()?;
     let topology = topology_from_args(args)?;
-    let netns_output = ProcessCommand::new("ip")
-        .args(["netns", "list"])
-        .output()
-        .map_err(|err| virtualfacility::FacilityError::CommandFailed {
-            command: "ip netns list".to_string(),
-            code: None,
-            stderr: err.to_string(),
-        })?;
-    if !netns_output.status.success() {
-        return Err(virtualfacility::FacilityError::CommandFailed {
-            command: "ip netns list".to_string(),
-            code: netns_output.status.code(),
-            stderr: String::from_utf8_lossy(&netns_output.stderr).into_owned(),
-        });
-    }
-    let netns_list = String::from_utf8_lossy(&netns_output.stdout);
-    let bridge_output = ProcessCommand::new("ip")
-        .args(["link", "show", topology.bridge_name()])
-        .output()
-        .map_err(|err| virtualfacility::FacilityError::CommandFailed {
-            command: format!("ip link show {}", topology.bridge_name()),
-            code: None,
-            stderr: err.to_string(),
-        })?;
-
-    let bridge_present = bridge_output.status.success();
+    let netns_list = netns_names()?;
+    let bridge_present = bridge_exists(topology.bridge_name())?;
     let node_statuses = topology
         .nodes()
         .iter()
         .map(|node| {
             let netns = format!("vf-{}-node-{}", topology.name(), node.name());
-            let present = netns_list.contains(&netns);
+            let present = netns_list.iter().any(|existing| existing == &netns);
             (node, netns, present)
         })
         .collect::<Vec<_>>();
@@ -397,7 +465,7 @@ fn run_status(args: &[String]) -> Result<()> {
         .iter()
         .map(|pod| {
             let netns = topology.pod_namespace(pod.name())?;
-            let present = netns_list.contains(&netns);
+            let present = netns_list.iter().any(|existing| existing == &netns);
             Ok((pod, netns, present))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -423,61 +491,62 @@ fn run_status(args: &[String]) -> Result<()> {
     }
     println!();
 
-    println!("FACILITY  BRIDGE  BRIDGE-IP");
-    println!(
-        "{:<8}  {:<6}  {}",
-        topology.name(),
-        topology.bridge_name(),
-        topology.bridge_cidr()
-    );
+    println!("NETWORK");
+    if bridge_present {
+        println!("{:<10}  {:<14}  STATUS", "NAME", "BRIDGE-IP");
+        println!(
+            "{:<10}  {:<14}  present",
+            topology.bridge_name(),
+            topology.bridge_cidr()
+        );
+    } else {
+        println!("No networks found.");
+    }
     println!();
 
     println!("NODES");
-    println!("{:<14}  {:<32}  {:<14}  STATUS", "NAME", "NETNS", "UPLINK");
-    for (node, netns, present) in node_statuses {
-        println!(
-            "{:<14}  {:<32}  {:<14}  {}",
-            node.name(),
-            netns,
-            topology.node_uplink_cidr(node),
-            present_missing(present)
-        );
+    let present_nodes = node_statuses
+        .into_iter()
+        .filter(|(_, _, present)| *present)
+        .collect::<Vec<_>>();
+    if present_nodes.is_empty() {
+        println!("No nodes found.");
+    } else {
+        println!("{:<14}  {:<32}  {:<14}  STATUS", "NAME", "NETNS", "UPLINK");
+        for (node, netns, _) in present_nodes {
+            println!(
+                "{:<14}  {:<32}  {:<14}  present",
+                node.name(),
+                netns,
+                topology.node_uplink_cidr(node),
+            );
+        }
     }
     println!();
 
     println!("PODS");
-    println!(
-        "{:<10}  {:<14}  {:<32}  {:<14}  STATUS",
-        "NAME", "NODE", "NETNS", "IP"
-    );
-    for (pod, netns, present) in pod_statuses {
-        println!(
-            "{:<10}  {:<14}  {:<32}  {:<14}  {}",
-            pod.name(),
-            pod.node(),
-            netns,
-            topology.pod_cidr(pod),
-            present_missing(present)
-        );
-    }
-    println!();
-
-    println!("NETWORK");
-    println!("{:<10}  STATUS", "NAME");
-    println!(
-        "{:<10}  {}",
-        topology.bridge_name(),
-        present_missing(bridge_present)
-    );
-    Ok(())
-}
-
-fn present_missing(present: bool) -> &'static str {
-    if present {
-        "present"
+    let present_pods = pod_statuses
+        .into_iter()
+        .filter(|(_, _, present)| *present)
+        .collect::<Vec<_>>();
+    if present_pods.is_empty() {
+        println!("No pods found.");
     } else {
-        "missing"
+        println!(
+            "{:<10}  {:<14}  {:<32}  {:<14}  STATUS",
+            "NAME", "NODE", "NETNS", "IP"
+        );
+        for (pod, netns, _) in present_pods {
+            println!(
+                "{:<10}  {:<14}  {:<32}  {:<14}  present",
+                pod.name(),
+                pod.node(),
+                netns,
+                topology.pod_cidr(pod),
+            );
+        }
     }
+    Ok(())
 }
 
 fn run_ping(args: &[String]) -> Result<()> {
@@ -562,17 +631,20 @@ fn run_create(args: &[String]) -> Result<()> {
             }
         }
         "node" => {
+            if op_args.len() > 2 {
+                reject_extra_args("create node", &op_args[2..]);
+            }
             let node = op_args.get(1).map(String::as_str).unwrap_or("default-node");
+            let plan = topology.node_setup_plan(node)?;
             println!("creating node {node} for facility {}", topology.name());
-            apply_plan(&topology.node_setup_plan(node)?)?;
+            apply_plan(&plan)?;
         }
         "pod" => {
-            let Some(pod) = op_args.get(1).map(String::as_str) else {
-                eprintln!("{}", usage());
-                process::exit(2);
-            };
+            require_exact_args(&op_args, "create pod", 2);
+            let pod = &op_args[1];
+            let plan = topology.pod_setup_plan(pod)?;
             println!("creating pod {pod} for facility {}", topology.name());
-            apply_plan(&topology.pod_setup_plan(pod)?)?;
+            apply_plan(&plan)?;
         }
         other => {
             eprintln!("unknown create target `{other}`");
@@ -601,6 +673,23 @@ fn run_delete(args: &[String]) -> Result<()> {
     let topology = topology_from_args(&effective_args)?;
     match op_args[0].as_str() {
         "bridge" => {
+            require_bridge_exists(topology.bridge_name())?;
+            let existing_netns = netns_names()?;
+            let dependent_netns = topology
+                .node_namespace_names()
+                .into_iter()
+                .chain(topology.pod_namespace_names())
+                .filter(|netns| existing_netns.iter().any(|existing| existing == netns))
+                .collect::<Vec<_>>();
+            if !dependent_netns.is_empty() {
+                eprintln!(
+                    "cannot delete bridge `{}` while namespaces still exist: {}",
+                    topology.bridge_name(),
+                    dependent_netns.join(", ")
+                );
+                eprintln!("delete pods and nodes first, or run `cargo run -- down`");
+                process::exit(1);
+            }
             println!(
                 "deleting bridge {} for facility {}",
                 topology.bridge_name(),
@@ -609,17 +698,24 @@ fn run_delete(args: &[String]) -> Result<()> {
             apply_plan(&topology.bridge_cleanup_plan())?;
         }
         "node" => {
-            let node = op_args.get(1).map(String::as_str).unwrap_or("default-node");
+            require_exact_args(&op_args, "delete node", 2);
+            let node = &op_args[1];
+            let plan = topology.node_cleanup_plan(node)?;
+            let netns = node_namespace(&topology, node)?;
+            let existing_netns = netns_names()?;
+            require_netns_exists("node", node, &netns, &existing_netns);
             println!("deleting node {node} for facility {}", topology.name());
-            apply_plan(&topology.node_cleanup_plan(node)?)?;
+            apply_plan(&plan)?;
         }
         "pod" => {
-            let Some(pod) = op_args.get(1).map(String::as_str) else {
-                eprintln!("{}", usage());
-                process::exit(2);
-            };
+            require_exact_args(&op_args, "delete pod", 2);
+            let pod = &op_args[1];
+            let plan = topology.pod_cleanup_plan(pod)?;
+            let netns = topology.pod_namespace(pod)?;
+            let existing_netns = netns_names()?;
+            require_netns_exists("pod", pod, &netns, &existing_netns);
             println!("deleting pod {pod} for facility {}", topology.name());
-            apply_plan(&topology.pod_cleanup_plan(pod)?)?;
+            apply_plan(&plan)?;
         }
         other => {
             eprintln!("unknown delete target `{other}`");
@@ -706,15 +802,15 @@ fn usage() -> &'static str {
     "usage:
   virtualfacility [--name facility] [--bridge bridge] plan
   virtualfacility [--name facility] [--bridge bridge] up
-  virtualfacility [--name facility] [--bridge bridge] create bridge [bridge-name]
+  virtualfacility [--name facility] [--bridge bridge] create bridge <bridge-name>
   virtualfacility [--name facility] [--bridge bridge] create node [node-name]
   virtualfacility [--name facility] [--bridge bridge] create pod <pod-name>
   virtualfacility [--name facility] [--bridge bridge] status
   virtualfacility [--name facility] [--bridge bridge] exec <pod> -- <command> [args...]
   virtualfacility [--name facility] [--bridge bridge] ping [source-pod] [target-pod]
   virtualfacility [--name facility] [--bridge bridge] delete pod <pod-name>
-  virtualfacility [--name facility] [--bridge bridge] delete node [node-name]
-  virtualfacility [--name facility] [--bridge bridge] delete bridge [bridge-name]
+  virtualfacility [--name facility] [--bridge bridge] delete node <node-name>
+  virtualfacility [--name facility] [--bridge bridge] delete bridge <bridge-name>
   virtualfacility [--name facility] [--bridge bridge] down
   virtualfacility use <facility> [--bridge bridge]
   virtualfacility current
