@@ -565,6 +565,14 @@ impl Topology {
             })
     }
 
+    pub fn node_namespace(&self, node_name: &str) -> Result<String> {
+        self.node_by_name(node_name)
+            .map(|node| node.netns(&self.name))
+            .ok_or_else(|| FacilityError::UnknownNodeName {
+                name: node_name.to_string(),
+            })
+    }
+
     pub fn node_namespace_names(&self) -> Vec<String> {
         self.nodes
             .iter()
@@ -684,11 +692,7 @@ impl Topology {
     pub fn cleanup_plan(&self) -> CommandPlan {
         let mut plan = CommandPlan::new();
         for pod in self.pods.iter().rev() {
-            plan.push(PlanStep::best_effort(
-                Stage::Cleanup,
-                format!("delete pod namespace `{}`", pod.netns(&self.name)),
-                CommandSpec::new("ip", ["netns", "del", pod.netns(&self.name).as_str()]),
-            ));
+            self.pod_cleanup(&mut plan, pod);
         }
         for node in self.nodes.iter().rev() {
             self.node_cleanup(&mut plan, node);
@@ -933,6 +937,17 @@ impl Topology {
         ));
         plan.push(PlanStep::best_effort(
             Stage::Cleanup,
+            format!(
+                "delete legacy node namespace `{}`",
+                node.legacy_netns(&self.name)
+            ),
+            CommandSpec::new(
+                "ip",
+                ["netns", "del", node.legacy_netns(&self.name).as_str()],
+            ),
+        ));
+        plan.push(PlanStep::best_effort(
+            Stage::Cleanup,
             format!("delete host veth `{}`", node.host_veth(&self.name)),
             CommandSpec::new("ip", ["link", "del", node.host_veth(&self.name).as_str()]),
         ));
@@ -1083,6 +1098,17 @@ impl Topology {
             Stage::Cleanup,
             format!("delete pod namespace `{}`", pod.netns(&self.name)),
             CommandSpec::new("ip", ["netns", "del", pod.netns(&self.name).as_str()]),
+        ));
+        plan.push(PlanStep::best_effort(
+            Stage::Cleanup,
+            format!(
+                "delete legacy pod namespace `{}`",
+                pod.legacy_netns(&self.name)
+            ),
+            CommandSpec::new(
+                "ip",
+                ["netns", "del", pod.legacy_netns(&self.name).as_str()],
+            ),
         ));
     }
 
@@ -1326,6 +1352,10 @@ impl Node {
     }
 
     fn netns(&self, facility: &str) -> String {
+        format!("vf-{facility}-n-{}", self.name)
+    }
+
+    fn legacy_netns(&self, facility: &str) -> String {
         format!("vf-{facility}-node-{}", self.name)
     }
 
@@ -1348,6 +1378,10 @@ impl Pod {
     }
 
     fn netns(&self, facility: &str) -> String {
+        format!("vf-{facility}-p-{}", self.name)
+    }
+
+    fn legacy_netns(&self, facility: &str) -> String {
         format!("vf-{facility}-pod-{}", self.name)
     }
 
@@ -1672,11 +1706,11 @@ mod tests {
         let rendered = topology.setup_plan().render_shell();
 
         assert!(rendered.contains("ip link add vf-br0 type bridge"));
-        assert!(rendered.contains("ip netns add vf-smoke-node-default-node"));
+        assert!(rendered.contains("ip netns add vf-smoke-n-default-node"));
         assert!(rendered.contains("ip link add vfsmokeh0 type veth peer name vfsmoken0"));
-        assert!(rendered.contains("ip netns add vf-smoke-pod-server"));
+        assert!(rendered.contains("ip netns add vf-smoke-p-server"));
         assert!(rendered
-            .contains("ip netns exec vf-smoke-pod-server ip route add default via 10.244.2.1"));
+            .contains("ip netns exec vf-smoke-p-server ip route add default via 10.244.2.1"));
     }
 
     #[test]
@@ -1694,7 +1728,7 @@ mod tests {
         let rendered = topology.workload_plan().unwrap().render_shell();
 
         assert!(rendered
-            .contains("ip netns exec vf-with-workload-pod-server python3 -m http.server 8080"));
+            .contains("ip netns exec vf-with-workload-p-server python3 -m http.server 8080"));
     }
 
     #[test]
@@ -1705,7 +1739,7 @@ mod tests {
             .unwrap()
             .render_shell();
 
-        assert!(rendered.contains("ip netns exec vf-smoke-pod-client ping -c 1 10.244.2.2"));
+        assert!(rendered.contains("ip netns exec vf-smoke-p-client ping -c 1 10.244.2.2"));
     }
 
     #[test]
@@ -1714,7 +1748,7 @@ mod tests {
 
         assert_eq!(
             topology.pod_namespace("client").unwrap(),
-            "vf-smoke-pod-client"
+            "vf-smoke-p-client"
         );
     }
 

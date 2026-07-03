@@ -190,7 +190,7 @@ fn read_saved_context() -> Option<FacilityContext> {
             _ => {}
         }
     }
-    Some(context)
+    Some(normalize_saved_context(context))
 }
 
 fn write_context(context: &FacilityContext) -> Result<()> {
@@ -208,6 +208,20 @@ fn empty_state(context: FacilityContext) -> FacilityState {
         nodes: Vec::new(),
         pods: Vec::new(),
     }
+}
+
+fn normalize_saved_context(context: FacilityContext) -> FacilityContext {
+    let expected_bridge = default_bridge_for_name(&context.name);
+    if context.bridge.starts_with("vf-")
+        && context.bridge != expected_bridge
+        && facility_from_bridge(&context.bridge) != context.name
+    {
+        return FacilityContext {
+            name: context.name,
+            bridge: expected_bridge,
+        };
+    }
+    context
 }
 
 fn state_index(states: &[FacilityState], name: &str) -> Option<usize> {
@@ -244,10 +258,10 @@ fn read_all_states() -> Vec<FacilityState> {
                 };
                 upsert_state(
                     &mut states,
-                    empty_state(FacilityContext {
+                    empty_state(normalize_saved_context(FacilityContext {
                         name: (*name).to_string(),
                         bridge: (*bridge).to_string(),
-                    }),
+                    })),
                 );
             }
             "name" if !value.is_empty() => {
@@ -334,7 +348,7 @@ fn read_all_states() -> Vec<FacilityState> {
         upsert_state(
             &mut states,
             FacilityState {
-                context: legacy_context,
+                context: normalize_saved_context(legacy_context),
                 nodes: legacy_nodes,
                 pods: legacy_pods,
             },
@@ -462,7 +476,7 @@ fn first_command_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--name" | "--bridge" | "--node" => {
+            "--name" | "--network" | "--node" => {
                 i += 2;
             }
             "--i-understand" => {
@@ -492,9 +506,9 @@ fn context_from_args(args: &[String]) -> FacilityContext {
                 name_was_set = true;
                 i += 2;
             }
-            "--bridge" => {
+            "--network" => {
                 let Some(value) = args.get(i + 1) else {
-                    eprintln!("--bridge requires a value");
+                    eprintln!("--network requires a value");
                     process::exit(2);
                 };
                 bridge_name = value.clone();
@@ -512,7 +526,9 @@ fn context_from_args(args: &[String]) -> FacilityContext {
             }
         }
     }
-    if name_was_set && !bridge_was_set {
+    if bridge_was_set && !name_was_set {
+        facility_name = facility_from_bridge(&bridge_name);
+    } else if name_was_set && !bridge_was_set {
         bridge_name = default_bridge_for_name(&facility_name);
     }
 
@@ -614,10 +630,10 @@ fn topology_from_args(args: &[String]) -> Result<Topology> {
     topology_for_state(&context, &state)
 }
 
-fn explicit_bridge(args: &[String]) -> Option<String> {
+fn explicit_network(args: &[String]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--bridge" {
+        if args[i] == "--network" {
             return args.get(i + 1).cloned();
         }
         i += 1;
@@ -688,7 +704,7 @@ fn args_with_context(name: &str, bridge: &str) -> Vec<String> {
     vec![
         "--name".to_string(),
         name.to_string(),
-        "--bridge".to_string(),
+        "--network".to_string(),
         bridge.to_string(),
     ]
 }
@@ -724,7 +740,7 @@ fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> 
             bridge: bridge.clone(),
         };
     }
-    if let Some(bridge) = explicit_bridge(args) {
+    if let Some(bridge) = explicit_network(args) {
         return FacilityContext {
             name: explicit_name(args).unwrap_or_else(|| facility_from_bridge(&bridge)),
             bridge,
@@ -735,7 +751,7 @@ fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> 
         .map(|name| default_bridge_for_name(&name))
         .or_else(|| read_saved_context().map(|context| context.bridge))
         .unwrap_or_else(|| default_context().bridge);
-    eprintln!("bridge name is required.");
+    eprintln!("network name is required.");
     eprintln!("suggested: {suggested}");
     eprintln!("example: cargo run -- {action} bridge {suggested}");
     if suggested != "vf-lab1" {
@@ -778,15 +794,27 @@ fn context_for_create_resource(
         Ok(Some(context)) => Ok(context),
         Ok(None) => Ok(read_context()),
         Err(bridges) => {
-            eprintln!("multiple networks exist; specify --bridge for `{command}`");
+            eprintln!("multiple networks exist; specify --network for `{command}`");
             eprintln!("available networks:");
             for bridge in &bridges {
                 eprintln!("  {bridge}");
             }
-            eprintln!("example: cargo run -- {command} {name} --bridge <network>");
+            eprintln!("example: cargo run -- {command} {name} --network <network>");
             process::exit(2);
         }
     }
+}
+
+fn context_for_create_pod(args: &[String], pod_name: &str) -> Result<FacilityContext> {
+    if has_explicit_scope(args) {
+        return Ok(context_from_args(args));
+    }
+    if let Some(node) = explicit_node(args) {
+        if looks_like_resource_id(&node) {
+            return Ok(resolve_delete_node_match(&node)?.state.context);
+        }
+    }
+    context_for_create_resource(args, "create pod", pod_name)
 }
 
 fn ensure_linux() -> Result<()> {
@@ -889,15 +917,33 @@ fn bridge_ipv4_cidr(bridge: &str) -> Result<Option<String>> {
         .next())
 }
 
-fn node_namespace(topology: &Topology, node_name: &str) -> Result<String> {
-    topology
-        .nodes()
+fn legacy_node_namespace(topology: &Topology, node_name: &str) -> String {
+    format!("vf-{}-node-{}", topology.name(), node_name)
+}
+
+fn legacy_pod_namespace(topology: &Topology, pod_name: &str) -> String {
+    format!("vf-{}-pod-{}", topology.name(), pod_name)
+}
+
+fn existing_namespace(candidates: &[String], netns_list: &[String]) -> Option<String> {
+    candidates
         .iter()
-        .find(|node| node.name() == node_name)
-        .map(|node| format!("vf-{}-node-{}", topology.name(), node.name()))
-        .ok_or_else(|| virtualfacility::FacilityError::UnknownNodeName {
-            name: node_name.to_string(),
-        })
+        .find(|candidate| netns_list.iter().any(|existing| existing == *candidate))
+        .cloned()
+}
+
+fn node_namespace_candidates(topology: &Topology, node_name: &str) -> Result<Vec<String>> {
+    Ok(vec![
+        topology.node_namespace(node_name)?,
+        legacy_node_namespace(topology, node_name),
+    ])
+}
+
+fn pod_namespace_candidates(topology: &Topology, pod_name: &str) -> Result<Vec<String>> {
+    Ok(vec![
+        topology.pod_namespace(pod_name)?,
+        legacy_pod_namespace(topology, pod_name),
+    ])
 }
 
 fn require_bridge_exists(bridge: &str) -> Result<()> {
@@ -916,11 +962,23 @@ fn require_netns_exists(kind: &str, name: &str, netns: &str, netns_list: &[Strin
     process::exit(1);
 }
 
-fn facility_netns_prefixes(facility: &str) -> (String, String) {
-    (
-        format!("vf-{facility}-node-"),
-        format!("vf-{facility}-pod-"),
-    )
+fn parse_facility_netns_name(facility: &str, netns: &str) -> Option<(&'static str, String)> {
+    let new_node = format!("vf-{facility}-n-");
+    if let Some(name) = netns.strip_prefix(&new_node) {
+        return Some(("node", name.to_string()));
+    }
+    let old_node = format!("vf-{facility}-node-");
+    if let Some(name) = netns.strip_prefix(&old_node) {
+        return Some(("node", name.to_string()));
+    }
+    let new_pod = format!("vf-{facility}-p-");
+    if let Some(name) = netns.strip_prefix(&new_pod) {
+        return Some(("pod", name.to_string()));
+    }
+    let old_pod = format!("vf-{facility}-pod-");
+    netns
+        .strip_prefix(&old_pod)
+        .map(|name| ("pod", name.to_string()))
 }
 
 fn operation_args(args: &[String]) -> Vec<String> {
@@ -928,7 +986,7 @@ fn operation_args(args: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--name" | "--bridge" | "--node" => {
+            "--name" | "--network" | "--node" => {
                 i += 2;
             }
             "--i-understand" => {
@@ -944,7 +1002,7 @@ fn operation_args(args: &[String]) -> Vec<String> {
 }
 
 fn has_explicit_scope(args: &[String]) -> bool {
-    explicit_name(args).is_some() || explicit_bridge(args).is_some()
+    explicit_name(args).is_some() || explicit_network(args).is_some()
 }
 
 fn ensure_status_state(states: &mut Vec<FacilityState>, context: FacilityContext) {
@@ -968,36 +1026,73 @@ fn stable_hash(parts: &[&str]) -> String {
 }
 
 fn resource_id(kind: &str, network: &str, name: &str) -> String {
-    let prefix = match kind {
-        "node" => "n",
-        "pod" => "p",
-        _ => "r",
-    };
-    format!("{prefix}-{}", stable_hash(&[kind, network, name]))
+    format!("{name}-{}", stable_hash(&[kind, network, name]))
 }
 
-fn is_resource_id(kind: &str, value: &str) -> bool {
-    let prefix = match kind {
-        "node" => "n-",
-        "pod" => "p-",
-        _ => return false,
+fn looks_like_resource_id(value: &str) -> bool {
+    let Some((_, suffix)) = value.rsplit_once('-') else {
+        return false;
     };
-    value.starts_with(prefix)
+    suffix.len() == 8 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn sync_states_from_netns(states: &mut [FacilityState], netns_list: &[String]) {
     for state in states {
-        let (node_prefix, pod_prefix) = facility_netns_prefixes(&state.context.name);
         for netns in netns_list {
-            if let Some(node_name) = netns.strip_prefix(&node_prefix) {
-                remember_node(state, node_name);
-                continue;
+            match parse_facility_netns_name(&state.context.name, netns) {
+                Some(("node", node_name)) => remember_node(state, &node_name),
+                Some(("pod", pod_name)) => {
+                    let node = default_node_for_state(state);
+                    remember_pod(state, &pod_name, &node);
+                }
+                _ => {}
             }
-            let Some(pod_name) = netns.strip_prefix(&pod_prefix) else {
-                continue;
-            };
-            let node = default_node_for_state(state);
-            remember_pod(state, pod_name, &node);
+        }
+    }
+}
+
+fn sync_state_from_netns(state: &mut FacilityState) -> Result<()> {
+    let netns_list = netns_names()?;
+    sync_states_from_netns(std::slice::from_mut(state), &netns_list);
+    Ok(())
+}
+
+fn select_node_for_create_pod(
+    state: &FacilityState,
+    explicit_node: Option<String>,
+) -> std::result::Result<String, String> {
+    if let Some(node) = explicit_node {
+        if looks_like_resource_id(&node) {
+            let topology =
+                topology_for_state(&state.context, state).map_err(|err| err.to_string())?;
+            for candidate in topology.nodes() {
+                if resource_id("node", topology.bridge_name(), candidate.name()) == node {
+                    return Ok(candidate.name().to_string());
+                }
+            }
+            return Err(format!(
+                "node id `{node}` does not exist in network {}",
+                state.context.bridge
+            ));
+        }
+        return Ok(node);
+    }
+    match state.nodes.as_slice() {
+        [] => Err(format!(
+            "network `{}` has no nodes; create one first: cargo run -- create node <node-name> --network {}",
+            state.context.bridge, state.context.bridge
+        )),
+        [node] => Ok(node.name.clone()),
+        nodes => {
+            let names = nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "network `{}` has multiple nodes: {}; specify --node",
+                state.context.bridge, names
+            ))
         }
     }
 }
@@ -1088,26 +1183,30 @@ fn run_status(args: &[String]) -> Result<()> {
             network_rows.push((topology.bridge_name().to_string(), cidr));
         }
         for node in topology.nodes() {
-            let netns = format!("vf-{}-node-{}", topology.name(), node.name());
-            if netns_list.iter().any(|existing| existing == &netns) {
+            if existing_namespace(
+                &node_namespace_candidates(&topology, node.name())?,
+                &netns_list,
+            )
+            .is_some()
+            {
                 node_rows.push((
-                    node.name().to_string(),
                     resource_id("node", topology.bridge_name(), node.name()),
                     topology.bridge_name().to_string(),
-                    netns,
                     topology.node_uplink_cidr(node),
                 ));
             }
         }
         for pod in topology.pods() {
-            let netns = topology.pod_namespace(pod.name())?;
-            if netns_list.iter().any(|existing| existing == &netns) {
+            if existing_namespace(
+                &pod_namespace_candidates(&topology, pod.name())?,
+                &netns_list,
+            )
+            .is_some()
+            {
                 pod_rows.push((
-                    pod.name().to_string(),
                     resource_id("pod", topology.bridge_name(), pod.name()),
                     topology.bridge_name().to_string(),
                     pod.node().to_string(),
-                    netns,
                     topology.pod_cidr(pod),
                 ));
             }
@@ -1145,14 +1244,11 @@ fn run_status(args: &[String]) -> Result<()> {
         println!("No nodes found.");
     } else {
         println!(
-            "{:<10}  {:<14}  {:<14}  {:<34}  {:<18}  STATUS",
-            "ID", "NAME", "NETWORK", "NETNS", "UPLINK"
+            "{:<24}  {:<14}  {:<18}  STATUS",
+            "ID", "NETWORK", "INTERNAL-IP"
         );
-        for (node, id, network, netns, uplink) in node_rows {
-            println!(
-                "{:<10}  {:<14}  {:<14}  {:<34}  {:<18}  present",
-                id, node, network, netns, uplink,
-            );
+        for (id, network, internal_ip) in node_rows {
+            println!("{:<24}  {:<14}  {:<18}  present", id, network, internal_ip,);
         }
     }
     println!();
@@ -1162,13 +1258,13 @@ fn run_status(args: &[String]) -> Result<()> {
         println!("No pods found.");
     } else {
         println!(
-            "{:<10}  {:<10}  {:<14}  {:<14}  {:<34}  {:<18}  STATUS",
-            "ID", "NAME", "NETWORK", "NODE", "NETNS", "IP"
+            "{:<24}  {:<14}  {:<14}  {:<18}  STATUS",
+            "ID", "NETWORK", "NODE", "IP"
         );
-        for (pod, id, network, node, netns, ip) in pod_rows {
+        for (id, network, node, ip) in pod_rows {
             println!(
-                "{:<10}  {:<10}  {:<14}  {:<14}  {:<34}  {:<18}  present",
-                id, pod, network, node, netns, ip,
+                "{:<24}  {:<14}  {:<14}  {:<18}  present",
+                id, network, node, ip,
             );
         }
     }
@@ -1250,7 +1346,7 @@ fn run_create(args: &[String]) -> Result<()> {
         }
         "pod" => {
             require_exact_args(&op_args, "create pod", 2);
-            context_for_create_resource(args, "create pod", &op_args[1])?
+            context_for_create_pod(args, &op_args[1])?
         }
         _ => context_from_args(args),
     };
@@ -1272,7 +1368,7 @@ fn run_create(args: &[String]) -> Result<()> {
                     state.context = context.clone();
                     write_state(&state)?;
                     println!("current environment: {}", context.name);
-                    println!("current bridge: {}", context.bridge);
+                    println!("current network: {}", context.bridge);
                 }
                 return Ok(());
             }
@@ -1287,7 +1383,7 @@ fn run_create(args: &[String]) -> Result<()> {
                 state.context = context.clone();
                 write_state(&state)?;
                 println!("current environment: {}", context.name);
-                println!("current bridge: {}", context.bridge);
+                println!("current network: {}", context.bridge);
             }
         }
         "node" => {
@@ -1295,12 +1391,13 @@ fn run_create(args: &[String]) -> Result<()> {
                 reject_extra_args("create node", &op_args[2..]);
             }
             let node = op_args.get(1).map(String::as_str).unwrap_or("default-node");
+            sync_state_from_netns(&mut state)?;
             remember_node(&mut state, node);
             let topology = topology_for_state(&context, &state)?;
             require_bridge_exists(topology.bridge_name())?;
-            let netns = node_namespace(&topology, node)?;
+            let netns_candidates = node_namespace_candidates(&topology, node)?;
             let existing_netns = netns_names()?;
-            if existing_netns.iter().any(|existing| existing == &netns) {
+            if existing_namespace(&netns_candidates, &existing_netns).is_some() {
                 println!(
                     "node {node} for environment {} already exists",
                     topology.name()
@@ -1316,16 +1413,28 @@ fn run_create(args: &[String]) -> Result<()> {
         "pod" => {
             require_exact_args(&op_args, "create pod", 2);
             let pod = &op_args[1];
-            let node = explicit_node(args).unwrap_or_else(|| default_node_for_state(&state));
+            let topology = topology_for_state(&context, &state)?;
+            require_bridge_exists(topology.bridge_name())?;
+            sync_state_from_netns(&mut state)?;
+            let node = select_node_for_create_pod(&state, explicit_node(args))
+                .unwrap_or_else(|message| fail_usage(message));
             remember_node(&mut state, &node);
             remember_pod(&mut state, pod, &node);
             let topology = topology_for_state(&context, &state)?;
-            require_bridge_exists(topology.bridge_name())?;
-            let node_netns = node_namespace(&topology, &node)?;
             let existing_netns = netns_names()?;
-            require_netns_exists("node", &node, &node_netns, &existing_netns);
-            let pod_netns = topology.pod_namespace(pod)?;
-            if existing_netns.iter().any(|existing| existing == &pod_netns) {
+            let node_netns_candidates = node_namespace_candidates(&topology, &node)?;
+            let Some(node_netns) = existing_namespace(&node_netns_candidates, &existing_netns)
+            else {
+                require_netns_exists("node", &node, &node_netns_candidates[0], &existing_netns);
+                unreachable!("require_netns_exists exits on missing namespace");
+            };
+            if node_netns != node_netns_candidates[0] {
+                fail_usage(format!(
+                    "node `{node}` uses legacy namespace `{node_netns}`; delete and recreate it before creating pods"
+                ));
+            }
+            let pod_netns_candidates = pod_namespace_candidates(&topology, pod)?;
+            if existing_namespace(&pod_netns_candidates, &existing_netns).is_some() {
                 println!(
                     "pod {pod} for environment {} already exists",
                     topology.name()
@@ -1353,21 +1462,19 @@ fn matching_node_targets(
     target: &str,
 ) -> Result<Vec<DeleteMatch>> {
     let mut matches = Vec::new();
-    let target_is_id = is_resource_id("node", target);
     for state in states {
         let topology = topology_for_state(&state.context, state)?;
         for node in topology.nodes() {
             let id = resource_id("node", topology.bridge_name(), node.name());
-            let matched = if target_is_id {
-                target == id
-            } else {
-                target == node.name()
-            };
-            if !matched {
+            if target != id && target != node.name() {
                 continue;
             }
-            let netns = node_namespace(&topology, node.name())?;
-            if netns_list.iter().any(|existing| existing == &netns) {
+            if existing_namespace(
+                &node_namespace_candidates(&topology, node.name())?,
+                netns_list,
+            )
+            .is_some()
+            {
                 matches.push(DeleteMatch {
                     state: state.clone(),
                     name: node.name().to_string(),
@@ -1385,21 +1492,19 @@ fn matching_pod_targets(
     target: &str,
 ) -> Result<Vec<DeleteMatch>> {
     let mut matches = Vec::new();
-    let target_is_id = is_resource_id("pod", target);
     for state in states {
         let topology = topology_for_state(&state.context, state)?;
         for pod in topology.pods() {
             let id = resource_id("pod", topology.bridge_name(), pod.name());
-            let matched = if target_is_id {
-                target == id
-            } else {
-                target == pod.name()
-            };
-            if !matched {
+            if target != id && target != pod.name() {
                 continue;
             }
-            let netns = topology.pod_namespace(pod.name())?;
-            if netns_list.iter().any(|existing| existing == &netns) {
+            if existing_namespace(
+                &pod_namespace_candidates(&topology, pod.name())?,
+                netns_list,
+            )
+            .is_some()
+            {
                 matches.push(DeleteMatch {
                     state: state.clone(),
                     name: pod.name().to_string(),
@@ -1429,7 +1534,7 @@ fn choose_delete_match(kind: &str, target: &str, matches: Vec<DeleteMatch>) -> D
     }
     eprintln!("delete by id: cargo run -- delete {kind} {}", matches[0].id);
     eprintln!(
-        "or specify network: cargo run -- delete {kind} {target} --bridge {}",
+        "or specify network: cargo run -- delete {kind} {target} --network {}",
         matches[0].state.context.bridge
     );
     process::exit(1);
@@ -1437,17 +1542,17 @@ fn choose_delete_match(kind: &str, target: &str, matches: Vec<DeleteMatch>) -> D
 
 fn resolve_scoped_node_match(state: &FacilityState, target: &str) -> Result<DeleteMatch> {
     let topology = topology_for_state(&state.context, state)?;
-    if is_resource_id("node", target) {
-        for node in topology.nodes() {
-            let id = resource_id("node", topology.bridge_name(), node.name());
-            if target == id {
-                return Ok(DeleteMatch {
-                    state: state.clone(),
-                    name: node.name().to_string(),
-                    id,
-                });
-            }
+    for node in topology.nodes() {
+        let id = resource_id("node", topology.bridge_name(), node.name());
+        if target == id || target == node.name() {
+            return Ok(DeleteMatch {
+                state: state.clone(),
+                name: node.name().to_string(),
+                id,
+            });
         }
+    }
+    if looks_like_resource_id(target) {
         eprintln!(
             "node id `{target}` does not exist in network {}",
             topology.bridge_name()
@@ -1463,17 +1568,17 @@ fn resolve_scoped_node_match(state: &FacilityState, target: &str) -> Result<Dele
 
 fn resolve_scoped_pod_match(state: &FacilityState, target: &str) -> Result<DeleteMatch> {
     let topology = topology_for_state(&state.context, state)?;
-    if is_resource_id("pod", target) {
-        for pod in topology.pods() {
-            let id = resource_id("pod", topology.bridge_name(), pod.name());
-            if target == id {
-                return Ok(DeleteMatch {
-                    state: state.clone(),
-                    name: pod.name().to_string(),
-                    id,
-                });
-            }
+    for pod in topology.pods() {
+        let id = resource_id("pod", topology.bridge_name(), pod.name());
+        if target == id || target == pod.name() {
+            return Ok(DeleteMatch {
+                state: state.clone(),
+                name: pod.name().to_string(),
+                id,
+            });
         }
+    }
+    if looks_like_resource_id(target) {
         eprintln!(
             "pod id `{target}` does not exist in network {}",
             topology.bridge_name()
@@ -1505,6 +1610,70 @@ fn resolve_delete_pod_match(target: &str) -> Result<DeleteMatch> {
     ))
 }
 
+fn require_delete_targets(op_args: &[String], command: &str) {
+    if op_args.len() < 2 {
+        fail_usage(format!("{command} requires a target name"));
+    }
+}
+
+fn delete_node_target(args: &[String], target: &str) -> Result<()> {
+    let context = context_from_args(args);
+    let mut state = read_state(&context);
+    let matched = if has_explicit_scope(args) {
+        resolve_scoped_node_match(&state, target)?
+    } else {
+        resolve_delete_node_match(target)?
+    };
+    state = matched.state.clone();
+    let node = matched.name;
+    remember_node(&mut state, &node);
+    let topology = topology_for_state(&state.context, &state)?;
+    let plan = topology.node_cleanup_plan(&node)?;
+    let existing_netns = netns_names()?;
+    let node_netns_candidates = node_namespace_candidates(&topology, &node)?;
+    if existing_namespace(&node_netns_candidates, &existing_netns).is_none() {
+        require_netns_exists("node", &node, &node_netns_candidates[0], &existing_netns);
+    }
+    println!(
+        "deleting node {node} ({}) from network {}",
+        matched.id,
+        topology.bridge_name()
+    );
+    apply_plan(&plan)?;
+    forget_node(&mut state, &node);
+    write_state(&state)
+}
+
+fn delete_pod_target(args: &[String], target: &str) -> Result<()> {
+    let context = context_from_args(args);
+    let mut state = read_state(&context);
+    let matched = if has_explicit_scope(args) {
+        resolve_scoped_pod_match(&state, target)?
+    } else {
+        resolve_delete_pod_match(target)?
+    };
+    state = matched.state.clone();
+    let pod = matched.name;
+    let node = explicit_node(args).unwrap_or_else(|| default_node_for_state(&state));
+    remember_node(&mut state, &node);
+    remember_pod(&mut state, &pod, &node);
+    let topology = topology_for_state(&state.context, &state)?;
+    let plan = topology.pod_cleanup_plan(&pod)?;
+    let existing_netns = netns_names()?;
+    let pod_netns_candidates = pod_namespace_candidates(&topology, &pod)?;
+    if existing_namespace(&pod_netns_candidates, &existing_netns).is_none() {
+        require_netns_exists("pod", &pod, &pod_netns_candidates[0], &existing_netns);
+    }
+    println!(
+        "deleting pod {pod} ({}) from network {}",
+        matched.id,
+        topology.bridge_name()
+    );
+    apply_plan(&plan)?;
+    forget_pod(&mut state, &pod);
+    write_state(&state)
+}
+
 fn run_delete(args: &[String]) -> Result<()> {
     let op_args = operation_args(args);
     if op_args.is_empty() {
@@ -1527,10 +1696,9 @@ fn run_delete(args: &[String]) -> Result<()> {
             let topology = topology_for_state(&context, &state)?;
             require_bridge_exists(topology.bridge_name())?;
             let existing_netns = netns_names()?;
-            let (node_prefix, pod_prefix) = facility_netns_prefixes(topology.name());
             let dependent_netns = existing_netns
                 .into_iter()
-                .filter(|netns| netns.starts_with(&node_prefix) || netns.starts_with(&pod_prefix))
+                .filter(|netns| parse_facility_netns_name(topology.name(), netns).is_some())
                 .collect::<Vec<_>>();
             if !dependent_netns.is_empty() {
                 eprintln!(
@@ -1548,59 +1716,20 @@ fn run_delete(args: &[String]) -> Result<()> {
             );
             apply_plan(&topology.bridge_cleanup_plan())?;
             state.pods.clear();
+            state.nodes.clear();
             write_state(&state)?;
         }
         "node" => {
-            require_exact_args(&op_args, "delete node", 2);
-            let target = &op_args[1];
-            let matched = if has_explicit_scope(args) {
-                resolve_scoped_node_match(&state, target)?
-            } else {
-                resolve_delete_node_match(target)?
-            };
-            state = matched.state.clone();
-            let node = matched.name;
-            remember_node(&mut state, &node);
-            let topology = topology_for_state(&state.context, &state)?;
-            let plan = topology.node_cleanup_plan(&node)?;
-            let netns = node_namespace(&topology, &node)?;
-            let existing_netns = netns_names()?;
-            require_netns_exists("node", &node, &netns, &existing_netns);
-            println!(
-                "deleting node {node} ({}) from network {}",
-                matched.id,
-                topology.bridge_name()
-            );
-            apply_plan(&plan)?;
-            forget_node(&mut state, &node);
-            write_state(&state)?;
+            require_delete_targets(&op_args, "delete node");
+            for target in &op_args[1..] {
+                delete_node_target(args, target)?;
+            }
         }
         "pod" => {
-            require_exact_args(&op_args, "delete pod", 2);
-            let target = &op_args[1];
-            let matched = if has_explicit_scope(args) {
-                resolve_scoped_pod_match(&state, target)?
-            } else {
-                resolve_delete_pod_match(target)?
-            };
-            state = matched.state.clone();
-            let pod = matched.name;
-            let node = explicit_node(args).unwrap_or_else(|| default_node_for_state(&state));
-            remember_node(&mut state, &node);
-            remember_pod(&mut state, &pod, &node);
-            let topology = topology_for_state(&state.context, &state)?;
-            let plan = topology.pod_cleanup_plan(&pod)?;
-            let netns = topology.pod_namespace(&pod)?;
-            let existing_netns = netns_names()?;
-            require_netns_exists("pod", &pod, &netns, &existing_netns);
-            println!(
-                "deleting pod {pod} ({}) from network {}",
-                matched.id,
-                topology.bridge_name()
-            );
-            apply_plan(&plan)?;
-            forget_pod(&mut state, &pod);
-            write_state(&state)?;
+            require_delete_targets(&op_args, "delete pod");
+            for target in &op_args[1..] {
+                delete_pod_target(args, target)?;
+            }
         }
         other => {
             eprintln!("unknown delete target `{other}`");
@@ -1618,11 +1747,11 @@ fn run_use(args: &[String]) -> Result<()> {
         .first()
         .cloned()
         .unwrap_or_else(|| topology.name().to_string());
-    let bridge = explicit_bridge(args).unwrap_or_else(|| default_bridge_for_name(&name));
+    let bridge = explicit_network(args).unwrap_or_else(|| default_bridge_for_name(&name));
     let context = FacilityContext { name, bridge };
     write_context(&context)?;
     println!("current environment: {}", context.name);
-    println!("current bridge: {}", context.bridge);
+    println!("current network: {}", context.bridge);
     println!("saved in {CONTEXT_FILE}");
     Ok(())
 }
@@ -1630,7 +1759,7 @@ fn run_use(args: &[String]) -> Result<()> {
 fn run_current() -> Result<()> {
     let context = read_context();
     println!("current environment: {}", context.name);
-    println!("current bridge: {}", context.bridge);
+    println!("current network: {}", context.bridge);
     println!("context file: {CONTEXT_FILE}");
     Ok(())
 }
@@ -1685,19 +1814,19 @@ fn run_smoke(confirmed: bool, args: &[String]) -> Result<()> {
 
 fn usage() -> &'static str {
     "usage:
-  virtualfacility [--name env] [--bridge bridge] plan
-  virtualfacility [--name env] [--bridge bridge] up
-  virtualfacility [--name env] [--bridge bridge] create bridge <bridge-name>
-  virtualfacility [--name env] [--bridge bridge] create node [node-name]
-  virtualfacility [--name env] [--bridge bridge] create pod <pod-name> [--node node-name]
-  virtualfacility [--name env] [--bridge bridge] status
-  virtualfacility [--name env] [--bridge bridge] exec <pod> -- <command> [args...]
-  virtualfacility [--name env] [--bridge bridge] ping [source-pod] [target-pod]
-  virtualfacility [--name env] [--bridge bridge] delete pod <pod-name-or-id> [--node node-name]
-  virtualfacility [--name env] [--bridge bridge] delete node <node-name-or-id>
-  virtualfacility [--name env] [--bridge bridge] delete bridge <bridge-name>
-  virtualfacility [--name env] [--bridge bridge] down
-  virtualfacility use <env> [--bridge bridge]
+  virtualfacility [--name env] [--network network] plan
+  virtualfacility [--name env] [--network network] up
+  virtualfacility [--name env] [--network network] create bridge <network-name>
+  virtualfacility [--name env] [--network network] create node [node-name]
+  virtualfacility [--name env] [--network network] create pod <pod-name> [--node node-name]
+  virtualfacility [--name env] [--network network] status
+  virtualfacility [--name env] [--network network] exec <pod> -- <command> [args...]
+  virtualfacility [--name env] [--network network] ping [source-pod] [target-pod]
+  virtualfacility [--name env] [--network network] delete pod <pod-name-or-id>... [--node node-name]
+  virtualfacility [--name env] [--network network] delete node <node-name-or-id>...
+  virtualfacility [--name env] [--network network] delete bridge <network-name>
+  virtualfacility [--name env] [--network network] down
+  virtualfacility use <env> [--network network]
   virtualfacility current
   virtualfacility workloads
   virtualfacility bootstrap [--i-understand]
@@ -1712,10 +1841,10 @@ runs a command inside a pod namespace. `smoke --i-understand` is create, ping,
 cleanup in one command. `bootstrap` still requires --i-understand because it
 wraps the current test process in user, mount, and network namespaces.
 
-Defaults: --name smoke --bridge vf-br0. `use` saves a local context so later
-commands can omit --name and --bridge. `create bridge vf-lab1` infers
---name lab1 --bridge vf-lab1 and saves that context. With multiple environments,
-commands target the current context unless --name or --bridge is provided."
+Defaults: --name smoke --network vf-br0. `use` saves a local context so later
+commands can omit --name and --network. `create bridge vf-lab1` infers
+--name lab1 --network vf-lab1 and saves that context. With multiple environments,
+commands target the current context unless --name or --network is provided."
 }
 
 #[cfg(test)]
@@ -1761,12 +1890,16 @@ mod tests {
             resource_id("pod", "vf-lab1", "app-2"),
             resource_id("pod", "vf-lab2", "app-2")
         );
-        assert!(resource_id("pod", "vf-lab1", "app-2").starts_with("p-"));
-        assert!(resource_id("node", "vf-lab1", "node-1").starts_with("n-"));
+        let pod_id = resource_id("pod", "vf-lab1", "app-2");
+        let node_id = resource_id("node", "vf-lab1", "node-1");
+        assert!(pod_id.starts_with("app-2-"));
+        assert!(node_id.starts_with("node-1-"));
+        assert!(looks_like_resource_id(&pod_id));
+        assert!(looks_like_resource_id(&node_id));
     }
 
     #[test]
-    fn create_context_requires_explicit_bridge_when_multiple_networks_exist() {
+    fn create_context_requires_explicit_network_when_multiple_networks_exist() {
         assert!(infer_single_network_context(&[]).unwrap().is_none());
 
         let one = infer_single_network_context(&["vf-lab1".to_string()])
@@ -1778,6 +1911,49 @@ mod tests {
         let many = infer_single_network_context(&["vf-lab1".to_string(), "vf-lab2".to_string()])
             .expect_err("multiple networks should require explicit selection");
         assert_eq!(many, vec!["vf-lab1".to_string(), "vf-lab2".to_string()]);
+    }
+
+    #[test]
+    fn explicit_network_without_name_derives_context_name_from_network() {
+        let context = context_from_args(&["--network".to_string(), "vf-lab1".to_string()]);
+
+        assert_eq!(context.name, "lab1");
+        assert_eq!(context.bridge, "vf-lab1");
+    }
+
+    #[test]
+    fn create_pod_requires_node_when_network_has_multiple_nodes() {
+        let state = state("lab1", "vf-lab1", &[("node-1", 0), ("node-2", 1)], &[]);
+        let err = select_node_for_create_pod(&state, None)
+            .expect_err("multiple nodes should require --node");
+        assert!(err.contains("network `vf-lab1` has multiple nodes"));
+        assert!(err.contains("node-1, node-2"));
+
+        let selected = select_node_for_create_pod(&state, Some("node-2".to_string()))
+            .expect("explicit node should be accepted");
+        assert_eq!(selected, "node-2");
+    }
+
+    #[test]
+    fn create_pod_accepts_node_id_as_explicit_node() {
+        let state = state("lab1", "vf-lab1", &[("node-1", 0), ("node-2", 1)], &[]);
+        let node_id = resource_id("node", "vf-lab1", "node-1");
+
+        let selected = select_node_for_create_pod(&state, Some(node_id))
+            .expect("node id should resolve inside the selected network");
+
+        assert_eq!(selected, "node-1");
+    }
+
+    #[test]
+    fn create_pod_rejects_node_id_from_another_network() {
+        let state = state("lab2", "vf-lab2", &[("node-1", 0)], &[]);
+        let node_id = resource_id("node", "vf-lab1", "node-1");
+
+        let err = select_node_for_create_pod(&state, Some(node_id))
+            .expect_err("foreign node id should not be accepted in this network");
+
+        assert!(err.contains("does not exist in network vf-lab2"));
     }
 
     #[test]

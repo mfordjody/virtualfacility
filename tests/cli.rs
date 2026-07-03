@@ -38,7 +38,7 @@ fn create_bridge_without_name_only_prints_hint_even_with_saved_context() {
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("bridge name is required."));
+    assert!(stderr.contains("network name is required."));
     assert!(stderr.contains("suggested: vf-lab1"));
     assert!(stderr.contains("example: cargo run -- create bridge vf-lab1"));
     assert!(!stderr.contains("creating bridge"));
@@ -105,13 +105,13 @@ fn delete_bridge_rejects_extra_targets() {
 }
 
 #[test]
-fn delete_pod_rejects_extra_targets() {
-    let workdir = temp_workdir("delete-pod-extra");
+fn delete_pod_requires_explicit_target() {
+    let workdir = temp_workdir("delete-pod-missing");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let output = Command::new(bin)
         .current_dir(&workdir)
-        .args(["delete", "pod", "client", "server", "proxy"])
+        .args(["delete", "pod"])
         .output()
         .expect("delete pod command should run");
 
@@ -119,8 +119,7 @@ fn delete_pod_rejects_extra_targets() {
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("delete pod accepts one target only"));
-    assert!(stderr.contains("unexpected extra arguments: server proxy"));
+    assert!(stderr.contains("delete pod requires a target name"));
     assert!(!stderr.contains("deleting pod"));
 }
 
@@ -224,7 +223,7 @@ fn bridge_name_selects_distinct_underlay_cidr() {
 
     let lab1 = Command::new(bin)
         .current_dir(&workdir)
-        .args(["--name", "lab1", "--bridge", "vf-lab1", "plan"])
+        .args(["--name", "lab1", "--network", "vf-lab1", "plan"])
         .output()
         .expect("plan command should run");
     assert!(
@@ -238,7 +237,7 @@ fn bridge_name_selects_distinct_underlay_cidr() {
 
     let lab2 = Command::new(bin)
         .current_dir(&workdir)
-        .args(["--name", "lab2", "--bridge", "vf-lab2", "plan"])
+        .args(["--name", "lab2", "--network", "vf-lab2", "plan"])
         .output()
         .expect("plan command should run");
     assert!(
@@ -252,7 +251,7 @@ fn bridge_name_selects_distinct_underlay_cidr() {
 
     let default = Command::new(bin)
         .current_dir(&workdir)
-        .args(["--name", "br0", "--bridge", "vf-br0", "plan"])
+        .args(["--name", "br0", "--network", "vf-br0", "plan"])
         .output()
         .expect("plan command should run");
     assert!(
