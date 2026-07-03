@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::process::{self, Command as ProcessCommand};
 
 use virtualfacility::{
@@ -516,7 +517,9 @@ fn context_from_args(args: &[String]) -> FacilityContext {
 
 fn topology_for_state(context: &FacilityContext, state: &FacilityState) -> Result<Topology> {
     let server_url = "http://10.244.2.2:8080".to_string();
-    let mut builder = Topology::builder(context.name.clone()).bridge_name(context.bridge.clone());
+    let mut builder = Topology::builder(context.name.clone())
+        .bridge_name(context.bridge.clone())
+        .bridge_addr(bridge_addr_for_name(&context.bridge));
     if state.nodes.is_empty() {
         builder = builder
             .add_node(DEFAULT_NODE)
@@ -566,6 +569,36 @@ fn topology_for_state(context: &FacilityContext, state: &FacilityState) -> Resul
         builder = builder.add_pod_with_index(&pod.name, &pod.node, pod.slot);
     }
     builder.build()
+}
+
+fn bridge_addr_for_name(bridge: &str) -> Ipv4Addr {
+    Ipv4Addr::new(10, 200, bridge_network_octet(bridge), 1)
+}
+
+fn bridge_network_octet(bridge: &str) -> u8 {
+    if bridge == "vf-br0" {
+        return 0;
+    }
+    if let Some(value) = trailing_number(bridge) {
+        let slot = value % 240;
+        return if slot == 0 { 1 } else { slot as u8 };
+    }
+    let hash = bridge.bytes().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u32)
+    });
+    (hash % 240 + 1) as u8
+}
+
+fn trailing_number(value: &str) -> Option<u32> {
+    let digits = value
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse().ok()
 }
 
 fn topology_from_args(args: &[String]) -> Result<Topology> {
@@ -773,6 +806,37 @@ fn bridge_names() -> Result<Vec<String>> {
         .collect())
 }
 
+fn bridge_ipv4_cidr(bridge: &str) -> Result<Option<String>> {
+    ensure_linux()?;
+    let output = ProcessCommand::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", bridge, "scope", "global"])
+        .output()
+        .map_err(|err| virtualfacility::FacilityError::CommandFailed {
+            command: format!("ip -o -4 addr show dev {bridge} scope global"),
+            code: None,
+            stderr: err.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(virtualfacility::FacilityError::CommandFailed {
+            command: format!("ip -o -4 addr show dev {bridge} scope global"),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            while let Some(part) = parts.next() {
+                if part == "inet" {
+                    return parts.next().map(str::to_string);
+                }
+            }
+            None
+        })
+        .next())
+}
+
 fn node_namespace(topology: &Topology, node_name: &str) -> Result<String> {
     topology
         .nodes()
@@ -910,17 +974,15 @@ fn run_status(args: &[String]) -> Result<()> {
             .iter()
             .any(|bridge| bridge.as_str() == topology.bridge_name());
         if bridge_present {
-            network_rows.push((
-                topology.name().to_string(),
-                topology.bridge_name().to_string(),
-                topology.bridge_cidr(),
-            ));
+            let cidr =
+                bridge_ipv4_cidr(topology.bridge_name())?.unwrap_or_else(|| topology.bridge_cidr());
+            network_rows.push((topology.bridge_name().to_string(), cidr));
         }
         for node in topology.nodes() {
             let netns = format!("vf-{}-node-{}", topology.name(), node.name());
             if netns_list.iter().any(|existing| existing == &netns) {
                 node_rows.push((
-                    topology.name().to_string(),
+                    topology.bridge_name().to_string(),
                     node.name().to_string(),
                     netns,
                     topology.node_uplink_cidr(node),
@@ -931,7 +993,7 @@ fn run_status(args: &[String]) -> Result<()> {
             let netns = topology.pod_namespace(pod.name())?;
             if netns_list.iter().any(|existing| existing == &netns) {
                 pod_rows.push((
-                    topology.name().to_string(),
+                    topology.bridge_name().to_string(),
                     pod.name().to_string(),
                     pod.node().to_string(),
                     netns,
@@ -960,12 +1022,9 @@ fn run_status(args: &[String]) -> Result<()> {
     if network_rows.is_empty() {
         println!("No networks found.");
     } else {
-        println!(
-            "{:<10}  {:<14}  {:<14}  STATUS",
-            "FACILITY", "NAME", "BRIDGE-IP"
-        );
-        for (facility, bridge, cidr) in network_rows {
-            println!("{facility:<10}  {bridge:<14}  {cidr:<14}  present");
+        println!("{:<14}  {:<14}  STATUS", "NAME", "BRIDGE-IP");
+        for (bridge, cidr) in network_rows {
+            println!("{bridge:<14}  {cidr:<14}  present");
         }
     }
     println!();
@@ -976,12 +1035,12 @@ fn run_status(args: &[String]) -> Result<()> {
     } else {
         println!(
             "{:<10}  {:<14}  {:<32}  {:<14}  STATUS",
-            "FACILITY", "NAME", "NETNS", "UPLINK"
+            "NETWORK", "NAME", "NETNS", "UPLINK"
         );
-        for (facility, node, netns, uplink) in node_rows {
+        for (network, node, netns, uplink) in node_rows {
             println!(
                 "{:<10}  {:<14}  {:<32}  {:<14}  present",
-                facility, node, netns, uplink,
+                network, node, netns, uplink,
             );
         }
     }
@@ -993,12 +1052,12 @@ fn run_status(args: &[String]) -> Result<()> {
     } else {
         println!(
             "{:<10}  {:<10}  {:<14}  {:<32}  {:<14}  STATUS",
-            "FACILITY", "NAME", "NODE", "NETNS", "IP"
+            "NETWORK", "NAME", "NODE", "NETNS", "IP"
         );
-        for (facility, pod, node, netns, ip) in pod_rows {
+        for (network, pod, node, netns, ip) in pod_rows {
             println!(
                 "{:<10}  {:<10}  {:<14}  {:<32}  {:<14}  present",
-                facility, pod, node, netns, ip,
+                network, pod, node, netns, ip,
             );
         }
     }
@@ -1081,7 +1140,7 @@ fn run_create(args: &[String]) -> Result<()> {
             let topology = topology_for_state(&context, &state)?;
             if bridge_exists(topology.bridge_name())? {
                 println!(
-                    "bridge {} for facility {} already exists",
+                    "bridge {} for environment {} already exists",
                     topology.bridge_name(),
                     topology.name()
                 );
@@ -1089,13 +1148,13 @@ fn run_create(args: &[String]) -> Result<()> {
                     write_context(&context)?;
                     state.context = context.clone();
                     write_state(&state)?;
-                    println!("current facility: {}", context.name);
+                    println!("current environment: {}", context.name);
                     println!("current bridge: {}", context.bridge);
                 }
                 return Ok(());
             }
             println!(
-                "creating bridge {} for facility {}",
+                "creating bridge {} for environment {}",
                 topology.bridge_name(),
                 topology.name()
             );
@@ -1104,7 +1163,7 @@ fn run_create(args: &[String]) -> Result<()> {
                 write_context(&context)?;
                 state.context = context.clone();
                 write_state(&state)?;
-                println!("current facility: {}", context.name);
+                println!("current environment: {}", context.name);
                 println!("current bridge: {}", context.bridge);
             }
         }
@@ -1120,14 +1179,14 @@ fn run_create(args: &[String]) -> Result<()> {
             let existing_netns = netns_names()?;
             if existing_netns.iter().any(|existing| existing == &netns) {
                 println!(
-                    "node {node} for facility {} already exists",
+                    "node {node} for environment {} already exists",
                     topology.name()
                 );
                 write_state(&state)?;
                 return Ok(());
             }
             let plan = topology.node_setup_plan(node)?;
-            println!("creating node {node} for facility {}", topology.name());
+            println!("creating node {node} for environment {}", topology.name());
             apply_plan(&plan)?;
             write_state(&state)?;
         }
@@ -1144,12 +1203,15 @@ fn run_create(args: &[String]) -> Result<()> {
             require_netns_exists("node", &node, &node_netns, &existing_netns);
             let pod_netns = topology.pod_namespace(pod)?;
             if existing_netns.iter().any(|existing| existing == &pod_netns) {
-                println!("pod {pod} for facility {} already exists", topology.name());
+                println!(
+                    "pod {pod} for environment {} already exists",
+                    topology.name()
+                );
                 write_state(&state)?;
                 return Ok(());
             }
             let plan = topology.pod_setup_plan(pod)?;
-            println!("creating pod {pod} for facility {}", topology.name());
+            println!("creating pod {pod} for environment {}", topology.name());
             apply_plan(&plan)?;
             write_state(&state)?;
         }
@@ -1199,7 +1261,7 @@ fn run_delete(args: &[String]) -> Result<()> {
                 process::exit(1);
             }
             println!(
-                "deleting bridge {} for facility {}",
+                "deleting bridge {} for environment {}",
                 topology.bridge_name(),
                 topology.name()
             );
@@ -1216,7 +1278,7 @@ fn run_delete(args: &[String]) -> Result<()> {
             let netns = node_namespace(&topology, node)?;
             let existing_netns = netns_names()?;
             require_netns_exists("node", node, &netns, &existing_netns);
-            println!("deleting node {node} for facility {}", topology.name());
+            println!("deleting node {node} for environment {}", topology.name());
             apply_plan(&plan)?;
             forget_node(&mut state, node);
             write_state(&state)?;
@@ -1232,7 +1294,7 @@ fn run_delete(args: &[String]) -> Result<()> {
             let netns = topology.pod_namespace(pod)?;
             let existing_netns = netns_names()?;
             require_netns_exists("pod", pod, &netns, &existing_netns);
-            println!("deleting pod {pod} for facility {}", topology.name());
+            println!("deleting pod {pod} for environment {}", topology.name());
             apply_plan(&plan)?;
             forget_pod(&mut state, pod);
             write_state(&state)?;
@@ -1256,7 +1318,7 @@ fn run_use(args: &[String]) -> Result<()> {
     let bridge = explicit_bridge(args).unwrap_or_else(|| default_bridge_for_name(&name));
     let context = FacilityContext { name, bridge };
     write_context(&context)?;
-    println!("current facility: {}", context.name);
+    println!("current environment: {}", context.name);
     println!("current bridge: {}", context.bridge);
     println!("saved in {CONTEXT_FILE}");
     Ok(())
@@ -1264,7 +1326,7 @@ fn run_use(args: &[String]) -> Result<()> {
 
 fn run_current() -> Result<()> {
     let context = read_context();
-    println!("current facility: {}", context.name);
+    println!("current environment: {}", context.name);
     println!("current bridge: {}", context.bridge);
     println!("context file: {CONTEXT_FILE}");
     Ok(())
@@ -1320,19 +1382,19 @@ fn run_smoke(confirmed: bool, args: &[String]) -> Result<()> {
 
 fn usage() -> &'static str {
     "usage:
-  virtualfacility [--name facility] [--bridge bridge] plan
-  virtualfacility [--name facility] [--bridge bridge] up
-  virtualfacility [--name facility] [--bridge bridge] create bridge <bridge-name>
-  virtualfacility [--name facility] [--bridge bridge] create node [node-name]
-  virtualfacility [--name facility] [--bridge bridge] create pod <pod-name> [--node node-name]
-  virtualfacility [--name facility] [--bridge bridge] status
-  virtualfacility [--name facility] [--bridge bridge] exec <pod> -- <command> [args...]
-  virtualfacility [--name facility] [--bridge bridge] ping [source-pod] [target-pod]
-  virtualfacility [--name facility] [--bridge bridge] delete pod <pod-name> [--node node-name]
-  virtualfacility [--name facility] [--bridge bridge] delete node <node-name>
-  virtualfacility [--name facility] [--bridge bridge] delete bridge <bridge-name>
-  virtualfacility [--name facility] [--bridge bridge] down
-  virtualfacility use <facility> [--bridge bridge]
+  virtualfacility [--name env] [--bridge bridge] plan
+  virtualfacility [--name env] [--bridge bridge] up
+  virtualfacility [--name env] [--bridge bridge] create bridge <bridge-name>
+  virtualfacility [--name env] [--bridge bridge] create node [node-name]
+  virtualfacility [--name env] [--bridge bridge] create pod <pod-name> [--node node-name]
+  virtualfacility [--name env] [--bridge bridge] status
+  virtualfacility [--name env] [--bridge bridge] exec <pod> -- <command> [args...]
+  virtualfacility [--name env] [--bridge bridge] ping [source-pod] [target-pod]
+  virtualfacility [--name env] [--bridge bridge] delete pod <pod-name> [--node node-name]
+  virtualfacility [--name env] [--bridge bridge] delete node <node-name>
+  virtualfacility [--name env] [--bridge bridge] delete bridge <bridge-name>
+  virtualfacility [--name env] [--bridge bridge] down
+  virtualfacility use <env> [--bridge bridge]
   virtualfacility current
   virtualfacility workloads
   virtualfacility bootstrap [--i-understand]
@@ -1349,6 +1411,6 @@ wraps the current test process in user, mount, and network namespaces.
 
 Defaults: --name smoke --bridge vf-br0. `use` saves a local context so later
 commands can omit --name and --bridge. `create bridge vf-lab1` infers
---name lab1 --bridge vf-lab1 and saves that context. With multiple facilities,
+--name lab1 --bridge vf-lab1 and saves that context. With multiple environments,
 commands target the current context unless --name or --bridge is provided."
 }

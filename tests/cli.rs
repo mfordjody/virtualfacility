@@ -216,3 +216,51 @@ fn create_custom_pod_accepts_explicit_node() {
     assert!(!stderr.contains("unknown node `node-1`"));
     assert!(!stderr.contains("unknown pod `app-1`"));
 }
+
+#[test]
+fn bridge_name_selects_distinct_underlay_cidr() {
+    let workdir = temp_workdir("bridge-cidr");
+    let bin = env!("CARGO_BIN_EXE_virtualfacility");
+
+    let lab1 = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["--name", "lab1", "--bridge", "vf-lab1", "plan"])
+        .output()
+        .expect("plan command should run");
+    assert!(
+        lab1.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&lab1.stderr)
+    );
+    let lab1_stdout = String::from_utf8_lossy(&lab1.stdout);
+    assert!(lab1_stdout.contains("bridge: vf-lab1 at 10.200.1.1/24"));
+    assert!(lab1_stdout.contains("assign node uplink address `10.200.1.10/24`"));
+
+    let lab2 = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["--name", "lab2", "--bridge", "vf-lab2", "plan"])
+        .output()
+        .expect("plan command should run");
+    assert!(
+        lab2.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&lab2.stderr)
+    );
+    let lab2_stdout = String::from_utf8_lossy(&lab2.stdout);
+    assert!(lab2_stdout.contains("bridge: vf-lab2 at 10.200.2.1/24"));
+    assert!(lab2_stdout.contains("assign node uplink address `10.200.2.10/24`"));
+
+    let default = Command::new(bin)
+        .current_dir(&workdir)
+        .args(["--name", "br0", "--bridge", "vf-br0", "plan"])
+        .output()
+        .expect("plan command should run");
+    assert!(
+        default.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_stdout = String::from_utf8_lossy(&default.stdout);
+    assert!(default_stdout.contains("bridge: vf-br0 at 10.200.0.1/24"));
+    assert!(default_stdout.contains("assign node uplink address `10.200.0.10/24`"));
+}

@@ -1123,7 +1123,8 @@ impl Topology {
     }
 
     fn node_uplink_ip(&self, node: &Node) -> Ipv4Addr {
-        Ipv4Addr::new(10, 200, 0, 10 + node.index as u8)
+        let [a, b, c, _] = self.bridge_addr.octets();
+        Ipv4Addr::new(a, b, c, 10 + node.index as u8)
     }
 
     fn pod_address(&self, pod: &Pod) -> PodAddress {
@@ -1142,6 +1143,11 @@ impl Topology {
 impl TopologyBuilder {
     pub fn bridge_name(mut self, name: impl Into<String>) -> Self {
         self.bridge_name = name.into();
+        self
+    }
+
+    pub fn bridge_addr(mut self, addr: Ipv4Addr) -> Self {
+        self.bridge_addr = addr;
         self
     }
 
