@@ -699,7 +699,7 @@ impl Topology {
         }
         plan.push(PlanStep::best_effort(
             Stage::Cleanup,
-            format!("delete bridge `{}`", self.bridge_name),
+            format!("delete network `{}`", self.bridge_name),
             CommandSpec::new("ip", ["link", "del", self.bridge_name.as_str()]),
         ));
         plan
@@ -736,7 +736,7 @@ impl Topology {
     pub fn render_summary(&self) -> String {
         let mut lines = vec![format!("facility: {}", self.name)];
         lines.push(format!(
-            "bridge: {} at {}/24",
+            "network: {} at {}/24",
             self.bridge_name, self.bridge_addr
         ));
         for node in &self.nodes {
@@ -764,7 +764,7 @@ impl Topology {
         plan.push(PlanStep::strict(
             Stage::Setup,
             format!(
-                "create bridge `{}` to stand in for the cluster underlay",
+                "create network `{}` as a Linux bridge underlay",
                 self.bridge_name
             ),
             CommandSpec::new(
@@ -774,7 +774,7 @@ impl Topology {
         ));
         plan.push(PlanStep::strict(
             Stage::Setup,
-            format!("assign bridge address `{}/24`", self.bridge_addr),
+            format!("assign network address `{}/24`", self.bridge_addr),
             CommandSpec::new(
                 "ip",
                 [
@@ -788,7 +788,7 @@ impl Topology {
         ));
         plan.push(PlanStep::strict(
             Stage::Setup,
-            format!("bring bridge `{}` up", self.bridge_name),
+            format!("bring network `{}` up", self.bridge_name),
             CommandSpec::new("ip", ["link", "set", self.bridge_name.as_str(), "up"]),
         ));
     }
@@ -796,7 +796,7 @@ impl Topology {
     fn bridge_cleanup(&self, plan: &mut CommandPlan) {
         plan.push(PlanStep::best_effort(
             Stage::Cleanup,
-            format!("delete bridge `{}`", self.bridge_name),
+            format!("delete network `{}`", self.bridge_name),
             CommandSpec::new("ip", ["link", "del", self.bridge_name.as_str()]),
         ));
     }

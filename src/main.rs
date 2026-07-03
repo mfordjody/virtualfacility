@@ -690,12 +690,12 @@ fn is_reserved_word(name: &str) -> bool {
 fn validate_new_bridge_name(bridge: &str) {
     if is_reserved_word(bridge) {
         fail_usage(format!(
-            "invalid bridge name `{bridge}`: command words cannot be used as resource names"
+            "invalid network name `{bridge}`: command words cannot be used as resource names"
         ));
     }
     if !bridge.starts_with("vf-") {
         fail_usage(format!(
-            "invalid bridge name `{bridge}`: bridge names must start with `vf-`, for example `vf-lab1`"
+            "invalid network name `{bridge}`: network names must start with `vf-`, for example `vf-lab1`"
         ));
     }
 }
@@ -730,9 +730,13 @@ fn require_exact_args(op_args: &[String], command: &str, expected_len: usize) {
     }
 }
 
-fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> FacilityContext {
+fn is_network_target(target: &str) -> bool {
+    target == "network" || target == "bridge"
+}
+
+fn network_context_or_exit(args: &[String], op_args: &[String], action: &str) -> FacilityContext {
     if op_args.len() > 2 {
-        reject_extra_args(&format!("{action} bridge"), &op_args[2..]);
+        reject_extra_args(&format!("{action} network"), &op_args[2..]);
     }
     if let Some(bridge) = op_args.get(1) {
         return FacilityContext {
@@ -753,9 +757,9 @@ fn bridge_context_or_exit(args: &[String], op_args: &[String], action: &str) -> 
         .unwrap_or_else(|| default_context().bridge);
     eprintln!("network name is required.");
     eprintln!("suggested: {suggested}");
-    eprintln!("example: cargo run -- {action} bridge {suggested}");
+    eprintln!("example: cargo run -- {action} network {suggested}");
     if suggested != "vf-lab1" {
-        eprintln!("example: cargo run -- {action} bridge vf-lab1");
+        eprintln!("example: cargo run -- {action} network vf-lab1");
     }
     process::exit(2);
 }
@@ -950,7 +954,7 @@ fn require_bridge_exists(bridge: &str) -> Result<()> {
     if bridge_exists(bridge)? {
         return Ok(());
     }
-    eprintln!("bridge `{bridge}` does not exist");
+    eprintln!("network `{bridge}` does not exist");
     process::exit(1);
 }
 
@@ -1213,21 +1217,7 @@ fn run_status(args: &[String]) -> Result<()> {
         }
     }
 
-    let actual_count = network_rows.len() + node_rows.len() + pod_rows.len();
-    let state = if actual_count == 0 {
-        "down"
-    } else if !network_rows.is_empty() && !node_rows.is_empty() && !pod_rows.is_empty() {
-        "running"
-    } else {
-        "partial"
-    };
-
-    println!("STATE: {state}");
-    if state == "down" {
-        println!("hint: run `cargo run -- up` to create this topology");
-    }
     println!();
-
     println!("NETWORKS");
     if network_rows.is_empty() {
         println!("No networks found.");
@@ -1323,20 +1313,26 @@ fn run_exec(args: &[String]) -> Result<()> {
 }
 
 fn run_create(args: &[String]) -> Result<()> {
-    let op_args = operation_args(args);
+    let mut op_args = operation_args(args);
+    if op_args.is_empty() && explicit_network(args).is_some() {
+        op_args.push("network".to_string());
+    }
     if op_args.is_empty() {
         eprintln!("{}", usage());
         process::exit(2);
     }
-    let bridge_context = if op_args.first().map(String::as_str) == Some("bridge") {
-        Some(bridge_context_or_exit(args, &op_args, "create"))
+    let network_context = if op_args
+        .first()
+        .is_some_and(|target| is_network_target(target))
+    {
+        Some(network_context_or_exit(args, &op_args, "create"))
     } else {
         None
     };
     let context = match op_args[0].as_str() {
-        "bridge" => {
-            let Some(context) = &bridge_context else {
-                unreachable!("bridge context is required for create bridge");
+        "network" | "bridge" => {
+            let Some(context) = &network_context else {
+                unreachable!("network context is required for create network");
             };
             context.clone()
         }
@@ -1352,18 +1348,18 @@ fn run_create(args: &[String]) -> Result<()> {
     };
     let mut state = read_state(&context);
     match op_args[0].as_str() {
-        "bridge" => {
-            if let Some(context) = &bridge_context {
+        "network" | "bridge" => {
+            if let Some(context) = &network_context {
                 validate_new_bridge_name(&context.bridge);
             }
             let topology = topology_for_state(&context, &state)?;
             if bridge_exists(topology.bridge_name())? {
                 println!(
-                    "bridge {} for environment {} already exists",
+                    "network {} for environment {} already exists",
                     topology.bridge_name(),
                     topology.name()
                 );
-                if let Some(context) = bridge_context {
+                if let Some(context) = network_context {
                     write_context(&context)?;
                     state.context = context.clone();
                     write_state(&state)?;
@@ -1373,12 +1369,12 @@ fn run_create(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "creating bridge {} for environment {}",
+                "creating network {} for environment {}",
                 topology.bridge_name(),
                 topology.name()
             );
             apply_plan(&topology.bridge_setup_plan())?;
-            if let Some(context) = bridge_context {
+            if let Some(context) = network_context {
                 write_context(&context)?;
                 state.context = context.clone();
                 write_state(&state)?;
@@ -1675,24 +1671,30 @@ fn delete_pod_target(args: &[String], target: &str) -> Result<()> {
 }
 
 fn run_delete(args: &[String]) -> Result<()> {
-    let op_args = operation_args(args);
+    let mut op_args = operation_args(args);
+    if op_args.is_empty() && explicit_network(args).is_some() {
+        op_args.push("network".to_string());
+    }
     if op_args.is_empty() {
         eprintln!("{}", usage());
         process::exit(2);
     }
-    let bridge_context = if op_args.first().map(String::as_str) == Some("bridge") {
-        Some(bridge_context_or_exit(args, &op_args, "delete"))
+    let network_context = if op_args
+        .first()
+        .is_some_and(|target| is_network_target(target))
+    {
+        Some(network_context_or_exit(args, &op_args, "delete"))
     } else {
         None
     };
-    let effective_args = bridge_context
+    let effective_args = network_context
         .as_ref()
         .map(|context| args_with_context(&context.name, &context.bridge))
         .unwrap_or_else(|| args.to_vec());
     let context = context_from_args(&effective_args);
     let mut state = read_state(&context);
     match op_args[0].as_str() {
-        "bridge" => {
+        "network" | "bridge" => {
             let topology = topology_for_state(&context, &state)?;
             require_bridge_exists(topology.bridge_name())?;
             let existing_netns = netns_names()?;
@@ -1702,7 +1704,7 @@ fn run_delete(args: &[String]) -> Result<()> {
                 .collect::<Vec<_>>();
             if !dependent_netns.is_empty() {
                 eprintln!(
-                    "cannot delete bridge `{}` while namespaces still exist: {}",
+                    "cannot delete network `{}` while namespaces still exist: {}",
                     topology.bridge_name(),
                     dependent_netns.join(", ")
                 );
@@ -1710,7 +1712,7 @@ fn run_delete(args: &[String]) -> Result<()> {
                 process::exit(1);
             }
             println!(
-                "deleting bridge {} for environment {}",
+                "deleting network {} for environment {}",
                 topology.bridge_name(),
                 topology.name()
             );
@@ -1816,7 +1818,8 @@ fn usage() -> &'static str {
     "usage:
   virtualfacility [--name env] [--network network] plan
   virtualfacility [--name env] [--network network] up
-  virtualfacility [--name env] [--network network] create bridge <network-name>
+  virtualfacility [--name env] [--network network] create network <network-name>
+  virtualfacility create --network <network-name>
   virtualfacility [--name env] [--network network] create node [node-name]
   virtualfacility [--name env] [--network network] create pod <pod-name> [--node node-name]
   virtualfacility [--name env] [--network network] status
@@ -1824,7 +1827,8 @@ fn usage() -> &'static str {
   virtualfacility [--name env] [--network network] ping [source-pod] [target-pod]
   virtualfacility [--name env] [--network network] delete pod <pod-name-or-id>... [--node node-name]
   virtualfacility [--name env] [--network network] delete node <node-name-or-id>...
-  virtualfacility [--name env] [--network network] delete bridge <network-name>
+  virtualfacility [--name env] [--network network] delete network <network-name>
+  virtualfacility delete --network <network-name>
   virtualfacility [--name env] [--network network] down
   virtualfacility use <env> [--network network]
   virtualfacility current
@@ -1842,7 +1846,7 @@ cleanup in one command. `bootstrap` still requires --i-understand because it
 wraps the current test process in user, mount, and network namespaces.
 
 Defaults: --name smoke --network vf-br0. `use` saves a local context so later
-commands can omit --name and --network. `create bridge vf-lab1` infers
+commands can omit --name and --network. `create network vf-lab1` infers
 --name lab1 --network vf-lab1 and saves that context. With multiple environments,
 commands target the current context unless --name or --network is provided."
 }

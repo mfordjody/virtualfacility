@@ -13,8 +13,8 @@ fn temp_workdir(test_name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn create_bridge_without_name_only_prints_hint_even_with_saved_context() {
-    let workdir = temp_workdir("create-bridge-hint");
+fn create_network_without_name_only_prints_hint_even_with_saved_context() {
+    let workdir = temp_workdir("create-network-hint");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let use_output = Command::new(bin)
@@ -30,9 +30,9 @@ fn create_bridge_without_name_only_prints_hint_even_with_saved_context() {
 
     let output = Command::new(bin)
         .current_dir(&workdir)
-        .args(["create", "bridge"])
+        .args(["create", "network"])
         .output()
-        .expect("create bridge command should run");
+        .expect("create network command should run");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
@@ -40,68 +40,68 @@ fn create_bridge_without_name_only_prints_hint_even_with_saved_context() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("network name is required."));
     assert!(stderr.contains("suggested: vf-lab1"));
-    assert!(stderr.contains("example: cargo run -- create bridge vf-lab1"));
-    assert!(!stderr.contains("creating bridge"));
+    assert!(stderr.contains("example: cargo run -- create network vf-lab1"));
+    assert!(!stderr.contains("creating network"));
 }
 
 #[test]
-fn create_bridge_rejects_command_word_name() {
-    let workdir = temp_workdir("create-bridge-command-word");
+fn create_network_rejects_command_word_name() {
+    let workdir = temp_workdir("create-network-command-word");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let output = Command::new(bin)
         .current_dir(&workdir)
-        .args(["create", "bridge", "status"])
+        .args(["create", "network", "status"])
         .output()
-        .expect("create bridge command should run");
+        .expect("create network command should run");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("invalid bridge name `status`"));
+    assert!(stderr.contains("invalid network name `status`"));
     assert!(stderr.contains("command words cannot be used as resource names"));
-    assert!(!stderr.contains("creating bridge"));
+    assert!(!stderr.contains("creating network"));
 }
 
 #[test]
-fn create_bridge_requires_vf_prefix() {
-    let workdir = temp_workdir("create-bridge-prefix");
+fn create_network_requires_vf_prefix() {
+    let workdir = temp_workdir("create-network-prefix");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let output = Command::new(bin)
         .current_dir(&workdir)
-        .args(["create", "bridge", "lab1"])
+        .args(["create", "network", "lab1"])
         .output()
-        .expect("create bridge command should run");
+        .expect("create network command should run");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("invalid bridge name `lab1`"));
-    assert!(stderr.contains("bridge names must start with `vf-`"));
-    assert!(!stderr.contains("creating bridge"));
+    assert!(stderr.contains("invalid network name `lab1`"));
+    assert!(stderr.contains("network names must start with `vf-`"));
+    assert!(!stderr.contains("creating network"));
 }
 
 #[test]
-fn delete_bridge_rejects_extra_targets() {
-    let workdir = temp_workdir("delete-bridge-extra");
+fn delete_network_rejects_extra_targets() {
+    let workdir = temp_workdir("delete-network-extra");
     let bin = env!("CARGO_BIN_EXE_virtualfacility");
 
     let output = Command::new(bin)
         .current_dir(&workdir)
-        .args(["delete", "bridge", "client", "server", "proxy"])
+        .args(["delete", "network", "client", "server", "proxy"])
         .output()
-        .expect("delete bridge command should run");
+        .expect("delete network command should run");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("delete bridge accepts one target only"));
+    assert!(stderr.contains("delete network accepts one target only"));
     assert!(stderr.contains("unexpected extra arguments: server proxy"));
-    assert!(!stderr.contains("deleting bridge"));
+    assert!(!stderr.contains("deleting network"));
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn bridge_name_selects_distinct_underlay_cidr() {
         String::from_utf8_lossy(&lab1.stderr)
     );
     let lab1_stdout = String::from_utf8_lossy(&lab1.stdout);
-    assert!(lab1_stdout.contains("bridge: vf-lab1 at 10.200.1.1/24"));
+    assert!(lab1_stdout.contains("network: vf-lab1 at 10.200.1.1/24"));
     assert!(lab1_stdout.contains("assign node uplink address `10.200.1.10/24`"));
 
     let lab2 = Command::new(bin)
@@ -246,7 +246,7 @@ fn bridge_name_selects_distinct_underlay_cidr() {
         String::from_utf8_lossy(&lab2.stderr)
     );
     let lab2_stdout = String::from_utf8_lossy(&lab2.stdout);
-    assert!(lab2_stdout.contains("bridge: vf-lab2 at 10.200.2.1/24"));
+    assert!(lab2_stdout.contains("network: vf-lab2 at 10.200.2.1/24"));
     assert!(lab2_stdout.contains("assign node uplink address `10.200.2.10/24`"));
 
     let default = Command::new(bin)
@@ -260,6 +260,6 @@ fn bridge_name_selects_distinct_underlay_cidr() {
         String::from_utf8_lossy(&default.stderr)
     );
     let default_stdout = String::from_utf8_lossy(&default.stdout);
-    assert!(default_stdout.contains("bridge: vf-br0 at 10.200.0.1/24"));
+    assert!(default_stdout.contains("network: vf-br0 at 10.200.0.1/24"));
     assert!(default_stdout.contains("assign node uplink address `10.200.0.10/24`"));
 }
